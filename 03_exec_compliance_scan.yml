@@ -1,0 +1,407 @@
+# =============================================================================
+# PLAY 1: CONFIGURATION (Plain Text / ASCII Only)
+# =============================================================================
+- name: Setup Environment
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    config_file: "./scc_env_config.yml"
+    report_dir: "./scc_reports/{{ ansible_date_time.date }}"
+
+  tasks:
+    - name: Check for Configuration File
+      stat:
+        path: "{{ config_file }}"
+      register: config_stat
+
+    # 2. INTERACTIVE SETUP
+    - name: First Run Wizard
+      block:
+        - name: Instructions
+          debug:
+            msg:
+              - "FIRST RUN SETUP"
+              - "Please enter the details below."
+              - "Press ENTER to use default values where available."
+
+        - name: Input AD Server
+          pause:
+            prompt: "Enter Active Directory Server FQDN (e.g. ldap.mil):"
+            echo: yes
+          register: input_ad_server
+
+        - name: Input Base DN
+          pause:
+            prompt: "Enter Base DN (e.g. DC=example,DC=com):"
+            echo: yes
+          register: input_base_dn
+
+        - name: Input Bind User
+          pause:
+            prompt: "Enter AD Bind User (user@domain or CN=User...):"
+            echo: yes
+          register: input_bind_user
+
+        - name: Input SCC Binary
+          pause:
+            prompt: "Enter Path to SCC Binary (Default: /opt/scc/cscc):"
+            echo: yes
+          register: input_scc_bin
+
+        - name: Input Profile ID
+          pause:
+            prompt: "Enter SCAP Profile ID (e.g. RHEL8_STIG):"
+            echo: yes
+          register: input_profile_id
+
+        # BASIC VALIDATION
+        - name: Validate Inputs
+          assert:
+            that:
+              - "input_ad_server.user_input | length > 0"
+              - "input_base_dn.user_input | length > 0"
+              - "input_bind_user.user_input | length > 0"
+              - "input_profile_id.user_input | length > 0"
+            fail_msg:
+              - "[ERROR] MISSING DATA"
+              - "You must provide values for AD Server, Base DN, User, and Profile."
+              - "Please re-run the playbook."
+
+        - name: Save Configuration
+          copy:
+            dest: "{{ config_file }}"
+            content: |
+              # SCC Automation Configuration
+              # Created: {{ ansible_date_time.iso8601 }}
+              ad_server: "{{ input_ad_server.user_input | trim }}"
+              ad_base_dn: "{{ input_base_dn.user_input | trim }}"
+              ad_bind_user: "{{ input_bind_user.user_input | trim }}"
+              scc_bin: "{{ (input_scc_bin.user_input | length > 0) | ternary(input_scc_bin.user_input, '/opt/scc/cscc') | trim }}"
+              profile_id: "{{ input_profile_id.user_input | trim }}"
+      when: not config_stat.stat.exists
+
+    - name: Load Variables
+      include_vars:
+        file: "{{ config_file }}"
+
+    - name: Create Directories
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Initialize Log
+      copy:
+        dest: "{{ report_dir }}/scan_audit_log.csv"
+        content: "Hostname,Status,Message,Artifact
+"
+        force: yes
+
+# =============================================================================
+# PLAY 2: TARGET DISCOVERY (Diagnostic & Config)
+# =============================================================================
+- name: Discover Targets
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    config_file: "./scc_env_config.yml"
+    discovery_script: "./ad_discovery_fips.py"
+    ldap_conf_path: "/tmp/ansible_ldap.conf"
+    cert_path: "/tmp/ad_cert.pem"
+  
+  vars_prompt:
+    - name: "ad_bind_password"
+      prompt: "Enter Active Directory Bind Password"
+      private: yes
+
+  tasks:
+    - name: Refresh Config
+      include_vars:
+        file: "{{ config_file }}"
+
+    # 1. FETCH CERT (Bypass FIPS constraints to grab the file)
+    - name: Fetch DC Certificate (Diagnostic)
+      shell: |
+        echo "Q" | timeout 2 openssl s_client -connect {{ ad_server }}:636 -showcerts 2>/dev/null | sed -n '/^-*BEGIN CERTIFICATE-*/,/^-*END CERTIFICATE-*/p' > {{ cert_path }}
+      register: cert_fetch
+      ignore_errors: yes
+
+    # 2. CREATE LDAP CONFIG (Force Trust & Protocol)
+    - name: Create FIPS-Compatible LDAP Config
+      copy:
+        dest: "{{ ldap_conf_path }}"
+        mode: '0644'
+        content: |
+          # Point to the cert we scraped (if any)
+          TLS_CACERT {{ cert_path }}
+          # Critical: Point to system store to satisfy FIPS init
+          TLS_CACERTDIR /etc/pki/tls/certs
+          
+          # Relax checks for self-signed
+          TLS_REQCERT allow
+          TLS_CRLCHECK none
+          
+          # Force TLS 1.2 (Protocol 3.3)
+          TLS_PROTOCOL_MIN 3.3
+
+    # 3. CREATE DISCOVERY SCRIPT
+    - name: Create Discovery Script
+      copy:
+        dest: "{{ discovery_script }}"
+        mode: '0700'
+        content: |
+          import sys
+          import json
+          import ldap
+          import socket
+
+          # Inputs
+          server = sys.argv[1]
+          user = sys.argv[2]
+          base_dn = sys.argv[3]
+          password = sys.stdin.readline().strip()
+
+          # We rely on LDAPCONF env var for crypto settings
+          
+          def try_bind(uri, label):
+              try:
+                  # Test TCP first
+                  host = uri.split("://")[1].split(":")[0]
+                  port = int(uri.split(":")[-1])
+                  socket.create_connection((host, port), timeout=2).close()
+
+                  # Initialize
+                  l = ldap.initialize(uri)
+                  l.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+                  l.set_option(ldap.OPT_REFERRALS, 0)
+                  
+                  # Bind
+                  l.simple_bind_s(user, password)
+                  
+                  # Search
+                  res = l.search_s(base_dn, ldap.SCOPE_SUBTREE, "(&(objectClass=computer)(operatingSystem=*Red Hat*8*))", ['dNSHostName'])
+                  
+                  hosts = []
+                  for dn, entry in res:
+                      if 'dNSHostName' in entry:
+                          val = entry['dNSHostName']
+                          if isinstance(val, list): val = val[0]
+                          if isinstance(val, bytes): val = val.decode('utf-8')
+                          hosts.append(val)
+                  
+                  return True, hosts, None
+              except Exception as e:
+                  return False, [], f"{label}: {e}"
+
+          # Try LDAPS (636)
+          success, hosts, err = try_bind(f"ldaps://{server}:636", "LDAPS")
+          if success:
+              print(json.dumps({"success": True, "hosts": hosts}))
+              sys.exit(0)
+          
+          # Try Global Catalog SSL (3269)
+          success_gc, hosts_gc, err_gc = try_bind(f"ldaps://{server}:3269", "GC-SSL")
+          if success_gc:
+              print(json.dumps({"success": True, "hosts": hosts_gc}))
+              sys.exit(0)
+
+          # Fail
+          print(json.dumps({"success": False, "error": f"{err} | {err_gc}"}))
+          sys.exit(1)
+
+    # 4. EXECUTE DISCOVERY
+    - name: Execute Discovery
+      command:
+        argv:
+          - /usr/bin/python3
+          - "{{ discovery_script }}"
+          - "{{ ad_server }}"
+          - "{{ ad_bind_user }}"
+          - "{{ ad_base_dn }}"
+        stdin: "{{ ad_bind_password }}"
+      environment:
+        LDAPCONF: "{{ ldap_conf_path }}"
+      register: script_output
+      ignore_errors: yes
+
+    # 5. PARSE
+    - name: Parse Results
+      set_fact:
+        scan_data: "{{ script_output.stdout | from_json }}"
+      when: script_output.rc == 0 or script_output.stdout | length > 0
+
+    # 6. DIAGNOSTIC FAILURE (If Script Failed)
+    - name: DIAGNOSIS - CONNECTION RESET
+      fail:
+        msg: 
+          - "FATAL: Connection Reset by Domain Controller."
+          - "The DC is rejecting the SSL Handshake immediately."
+          - "This implies the DC Certificate is not FIPS-compliant or not bound."
+          - ""
+          - ">>> ACTION REQUIRED ON DOMAIN CONTROLLER <<<"
+          - "Run this PowerShell command to replace the certificate:"
+          # FIXED: Double backslashes for cert:\LocalMachine\My
+          - "$cert = New-SelfSignedCertificate -DnsName '{{ ad_server }}' -CertStoreLocation 'cert:\LocalMachine\My' -Provider 'Microsoft Enhanced RSA and AES Cryptographic Provider' -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyUsage DigitalSignature,KeyEncipherment -Type SSLServerAuthentication -FriendlyName 'FIPS-LDAP-FIX'"
+          - "Restart-Service NTDS -Force"
+      when: 
+        - script_output.rc != 0
+        - "'Connection reset' in scan_data.error | default('')"
+
+    - name: Generic Failure
+      fail:
+        msg: "Discovery Failed: {{ scan_data.error | default('Unknown Error') }}"
+      when: script_output.rc != 0
+
+    # 7. SUCCESS
+    - name: Build Inventory
+      add_host:
+        name: "{{ item }}"
+        groups: "scap_targets"
+      loop: "{{ scan_data.hosts }}"
+      when: script_output.rc == 0
+
+    - name: Cleanup
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ discovery_script }}"
+        - "{{ ldap_conf_path }}"
+        - "{{ cert_path }}"
+
+# =============================================================================
+# PLAY 3: DISTRIBUTED SCAN
+# =============================================================================
+- name: Distributed SCAP Scan
+  hosts: scap_targets
+  become: yes
+  gather_facts: no
+  ignore_unreachable: yes
+
+  vars:
+    date_stamp: "{{ hostvars['localhost']['ansible_date_time']['date'] }}"
+    local_config: "{{ hostvars['localhost']['config_file'] }}"
+    audit_log: "./scc_reports/{{ date_stamp }}/scan_audit_log.csv"
+    remote_workspace: "/var/tmp/scc_scan_{{ date_stamp }}"
+
+  pre_tasks:
+    - name: Load Config
+      include_vars:
+        file: "{{ local_config }}"
+      delegate_to: localhost
+
+  tasks:
+    - block:
+        - name: Check SSH
+          wait_for_connection:
+            timeout: 10
+
+        - name: Check SCC Binary
+          stat:
+            path: "{{ scc_bin }}"
+          register: scc_stat
+        
+        - name: Fail if Missing
+          fail:
+            msg: "SCC Binary not found at {{ scc_bin }}"
+          when: not scc_stat.stat.exists
+
+        - name: Create Workspace
+          file:
+            path: "{{ remote_workspace }}"
+            state: directory
+            mode: '0700'
+
+        - name: Run Scanner
+          command: >
+            {{ scc_bin }}
+            --enableBenchmark {{ profile_id }}
+            --userDir "{{ remote_workspace }}"
+            --configDir "{{ remote_workspace }}"
+            --doNotSaveChanges
+            --quiet
+          register: scan_result
+          failed_when: false 
+
+        - name: Check Exit Code
+          fail:
+            msg: "Scanner Error Code: {{ scan_result.rc }}"
+          when: scan_result.rc > 5
+
+        - name: Fetch Report
+          fetch:
+            src: "{{ remote_workspace }}/Results/SCAP/{{ inventory_hostname }}_XCCDF.xml"
+            dest: "./scc_reports/{{ date_stamp }}/"
+            flat: yes
+          register: fetch_result
+
+        - name: Cleanup
+          file:
+            path: "{{ remote_workspace }}"
+            state: absent
+
+        - name: Log Success
+          lineinfile:
+            path: "{{ audit_log }}"
+            line: "{{ inventory_hostname }},SUCCESS,Scan Complete,{{ fetch_result.dest }}"
+          delegate_to: localhost
+          become: no
+
+      rescue:
+        - name: Log Failure
+          lineinfile:
+            path: "{{ audit_log }}"
+            line: "{{ inventory_hostname }},FAILURE,Scan Error,N/A"
+          delegate_to: localhost
+          become: no
+
+# =============================================================================
+# PLAY 4: REPORTING
+# =============================================================================
+- name: Generate Dashboard
+  hosts: localhost
+  connection: local
+  vars:
+    report_dir: "./scc_reports/{{ ansible_date_time.date }}"
+
+  tasks:
+    - name: Find XML Files
+      find:
+        paths: "{{ report_dir }}"
+        patterns: "*_XCCDF.xml"
+      register: xml_files
+
+    - name: Parse Scores
+      community.general.xml:
+        path: "{{ item.path }}"
+        xpath: "/xccdf:Benchmark/xccdf:TestResult/xccdf:score"
+        namespaces:
+          xccdf: "http://checklists.nist.gov/xccdf/1.2"
+      loop: "{{ xml_files.files }}"
+      register: scores
+      failed_when: false
+
+    - name: Write Summary
+      copy:
+        dest: "{{ report_dir }}/executive_summary.csv"
+        content: |
+          Hostname,Compliance Score,File Path
+          {% for result in scores.results %}
+          {% set host = result.item.path | basename | regex_replace('_XCCDF.xml', '') %}
+          {% if result.matches is defined and result.matches | length > 0 %}
+          {{ host }},{{ result.matches[0].score }},{{ result.item.path }}
+          {% else %}
+          {{ host }},DATA_ERROR,{{ result.item.path }}
+          {% endif %}
+          {% endfor %}
+
+    - name: Show Status
+      debug:
+        msg: 
+          - "SCAN COMPLETE"
+          - "Audit Log: {{ report_dir }}/scan_audit_log.csv"
+          - "Summary:   {{ report_dir }}/executive_summary.csv"
